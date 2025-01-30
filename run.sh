@@ -1,5 +1,5 @@
 INFILE=main.c
-OUTFILE=./tmpexe.elf
+OUTFILE=./tmpelf
 
 TESTCASE_FILE=$1
 [[ ! -e $TESTCASE_FILE ]] && echo "please specify a valid testcase file" && exit 1

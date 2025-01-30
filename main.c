@@ -24,11 +24,11 @@ struct level {
     /* the current number of gnomes present on this level */
     unsigned n_gnomes_current;
 
-    /* the current number of gnomes waiting to go down from this level */
-    unsigned n_gnomes_waiting_down;
+    /* the id of the gnome first in queue to go down */
+    long next_down_id;
 
-    /* the current number of gnomes waiting to go up from this level */
-    unsigned n_gnomes_waiting_up;
+    /* the id of the gnome first in queue to go up */
+    long next_up_id;
 
     /* the current number of ornaments present on this level */
     unsigned n_ornaments_current;
@@ -42,11 +42,16 @@ struct level {
     /* ensure exlusive access to n_ornaments */
     pthread_mutex_t n_ornaments_mutex;
 
-    /* enable waiting for a gnome to free a place from one level up */
-    pthread_cond_t waiting_at_upper_cond;
+    /* used to synchronize moving up */
+    pthread_mutex_t go_up_mutex;
+    pthread_cond_t go_up_cond;
+
+    /* used to synchronize moving down */
+    pthread_mutex_t go_down_mutex;
+    pthread_cond_t go_down_cond;
 
     /* enable waiting for a gnome to free a place from one level down */
-    pthread_cond_t waiting_at_lower_cond;
+
 };
 
 struct xmas_tree {
@@ -60,6 +65,13 @@ struct xmas_tree {
     /* this array stores the current level for each gnome */
     /* gnome_positions[i] == -1 <=> gnome number i is not on the tree */
     long *gnome_positions;
+
+    /* the id of the gnome first in queue to get up on the tree */
+    long next_enter_id;
+
+    /* used to synchronize moving up from the ground floor to level 0 */
+    pthread_mutex_t entrance_mutex;
+    pthread_cond_t entrance_cond;
 };
 
 struct ornament_delivery {
@@ -124,64 +136,125 @@ int init_xmas_tree(
         levels[i].gnome_cap = gnome_cap_list[i];
         levels[i].ornament_cap = ornament_cap_list[i];
         levels[i].n_gnomes_current = 0;
-        levels[i].n_gnomes_waiting_down = 0;
-        levels[i].n_gnomes_waiting_up = 0;
+        levels[i].next_down_id = -1;
+        levels[i].next_up_id = -1;
         levels[i].n_ornaments_current = 0;
         levels[i].n_ornaments_pending = 0;
         if (pthread_mutex_init(&levels[i].n_gnomes_mutex, NULL) != 0) {
             for (size_t j = 0; j < i; j++) {
-                pthread_mutex_destroy(&levels[i].n_gnomes_mutex);
+                pthread_mutex_destroy(&levels[j].n_gnomes_mutex);
             }
             free(levels);
             fprintf(stderr, "init_xmas_tree: "
-                "failed to initialize n_gnomes_mutex for levels[%lu]", i);
+                "failed to initialize n_gnomes_mutex for levels[%lu]\n", i);
             return -1;
         }
         if (pthread_mutex_init(&levels[i].n_ornaments_mutex, NULL) != 0) {
             for (size_t j = 0; j < n_levels; j++) {
-                pthread_mutex_destroy(&levels[i].n_gnomes_mutex);
+                pthread_mutex_destroy(&levels[j].n_gnomes_mutex);
             }
             for (size_t j = 0; j < i; j++) {
-                pthread_mutex_destroy(&levels[i].n_ornaments_mutex);
+                pthread_mutex_destroy(&levels[j].n_ornaments_mutex);
             }
             free(levels);
             fprintf(stderr, "init_xmas_tree: "
-                "failed to initialize n_ornaments_mutex for levels[%lu]", i);
+                "failed to initialize n_ornaments_mutex for levels[%lu]\n", i);
             return -1;
         }
-        if (pthread_cond_init(&levels[i].waiting_at_lower_cond, NULL) != 0) {
+        if (pthread_mutex_init(&levels[i].go_up_mutex, NULL) != 0) {
             for (size_t j = 0; j < n_levels; j++) {
-                pthread_mutex_destroy(&levels[i].n_gnomes_mutex);
-                pthread_mutex_destroy(&levels[i].n_ornaments_mutex);
+                pthread_mutex_destroy(&levels[j].n_gnomes_mutex);
+                pthread_mutex_destroy(&levels[j].n_ornaments_mutex);
             }
             for (size_t j = 0; j < i; j++) {
-                pthread_cond_destroy(&levels[i].waiting_at_lower_cond);
+                pthread_mutex_destroy(&levels[j].go_up_mutex);
             }
             free(levels);
             fprintf(stderr, "init_xmas_tree: "
-                "failed to initialize waiting_at_lower_cond for levels[%lu]", i);
+                "failed to initialize go_up_mutex for levels[%lu]\n", i);
             return -1;
         }
-        if (pthread_cond_init(&levels[i].waiting_at_upper_cond, NULL) != 0) {
+        if (pthread_mutex_init(&levels[i].go_down_mutex, NULL) != 0) {
             for (size_t j = 0; j < n_levels; j++) {
-                pthread_mutex_destroy(&levels[i].n_gnomes_mutex);
-                pthread_mutex_destroy(&levels[i].n_ornaments_mutex);
-                pthread_cond_destroy(&levels[i].waiting_at_lower_cond);
+                pthread_mutex_destroy(&levels[j].n_gnomes_mutex);
+                pthread_mutex_destroy(&levels[j].n_ornaments_mutex);
+                pthread_mutex_destroy(&levels[j].go_up_mutex);
             }
             for (size_t j = 0; j < i; j++) {
-                pthread_cond_destroy(&levels[i].waiting_at_upper_cond);
+                pthread_mutex_destroy(&levels[j].go_down_mutex);
             }
             free(levels);
             fprintf(stderr, "init_xmas_tree: "
-                "failed to initialize waiting_at_lower_cond for levels[%lu]", i);
+                "failed to initialize go_down_mutex for levels[%lu]\n", i);
             return -1;
         }
+        if (pthread_cond_init(&levels[i].go_up_cond, NULL) != 0) {
+            for (size_t j = 0; j < n_levels; j++) {
+                pthread_mutex_destroy(&levels[j].n_gnomes_mutex);
+                pthread_mutex_destroy(&levels[j].n_ornaments_mutex);
+                pthread_mutex_destroy(&levels[j].go_up_mutex);
+                pthread_mutex_destroy(&levels[j].go_down_mutex);
+            }
+            for (size_t j = 0; j < i; j++) {
+                pthread_cond_destroy(&levels[j].go_up_cond);
+            }
+            free(levels);
+            fprintf(stderr, "init_xmas_tree: "
+                "failed to initialize go_up_cond for levels[%lu]\n", i);
+            return -1;
+        }
+        if (pthread_cond_init(&levels[i].go_down_cond, NULL) != 0) {
+            for (size_t j = 0; j < n_levels; j++) {
+                pthread_mutex_destroy(&levels[j].n_gnomes_mutex);
+                pthread_mutex_destroy(&levels[j].n_ornaments_mutex);
+                pthread_mutex_destroy(&levels[j].go_up_mutex);
+                pthread_mutex_destroy(&levels[j].go_down_mutex);
+                pthread_cond_destroy(&levels[j].go_up_cond);
+            }
+            for (size_t j = 0; j < i; j++) {
+                pthread_cond_destroy(&levels[j].go_down_cond);
+            }
+            free(levels);
+            fprintf(stderr, "init_xmas_tree: "
+                "failed to initialize go_down_cond for levels[%lu]\n", i);
+            return -1;
+        }
+    }
+
+    if (pthread_mutex_init(&tree.entrance_mutex, NULL) != 0) {
+        for (size_t i = 0; i < n_levels; i++) {
+            pthread_mutex_destroy(&levels[i].n_gnomes_mutex);
+            pthread_mutex_destroy(&levels[i].n_ornaments_mutex);
+            pthread_mutex_destroy(&levels[i].go_up_mutex);
+            pthread_mutex_destroy(&levels[i].go_down_mutex);
+            pthread_cond_destroy(&levels[i].go_up_cond);
+            pthread_cond_destroy(&levels[i].go_down_cond);
+        }
+        free(levels);
+        fprintf(stderr, "init_xmas_tree: "
+            "failed to initialize entrance_mutex\n");
+    }
+
+    if (pthread_cond_init(&tree.entrance_cond, NULL) != 0) {
+        for (size_t i = 0; i < n_levels; i++) {
+            pthread_mutex_destroy(&levels[i].n_gnomes_mutex);
+            pthread_mutex_destroy(&levels[i].n_ornaments_mutex);
+            pthread_mutex_destroy(&levels[i].go_up_mutex);
+            pthread_mutex_destroy(&levels[i].go_down_mutex);
+            pthread_cond_destroy(&levels[i].go_up_cond);
+            pthread_cond_destroy(&levels[i].go_down_cond);
+        }
+        free(levels);
+        pthread_cond_destroy(&tree.entrance_cond);
+        fprintf(stderr, "init_xmas_tree: "
+            "failed to initialize entrance_cond\n");
     }
     
     tree.n_levels = n_levels;
     tree.levels = levels;
     tree.n_gnomes = n_gnomes;
     tree.gnome_positions = gnome_positions;
+    tree.next_enter_id = -1;
 
     return 0;
 }
@@ -191,8 +264,10 @@ void kill_xmas_tree() {
     for (size_t i = 0; i < tree.n_levels; i++) {
         pthread_mutex_destroy(&tree.levels[i].n_gnomes_mutex);
         pthread_mutex_destroy(&tree.levels[i].n_ornaments_mutex);
-        pthread_cond_destroy(&tree.levels[i].waiting_at_lower_cond);
-        pthread_cond_destroy(&tree.levels[i].waiting_at_upper_cond);
+        pthread_mutex_destroy(&tree.levels[i].go_up_mutex);
+        pthread_mutex_destroy(&tree.levels[i].go_down_mutex);
+        pthread_cond_destroy(&tree.levels[i].go_up_cond);
+        pthread_cond_destroy(&tree.levels[i].go_down_cond);
     }
     free(tree.levels);
 }
@@ -236,10 +311,11 @@ void *ornament_hanged(void *arg) {
 }
 
 // returns the level the gnome's at after the operation
+/*
 long go_up_the_tree(long current_level, unsigned gnome_id) {
     // if on the maximum level, stay
     if (current_level == tree.n_levels - 1) {
-        printf("gnome#%u stays at level#%lu", gnome_id, current_level);
+        printf("gnome#%u stays at level#%ld", gnome_id, current_level);
         return current_level;
     }
 
@@ -266,7 +342,7 @@ long go_up_the_tree(long current_level, unsigned gnome_id) {
         pthread_cond_signal(&tree.levels[current_level].waiting_at_upper_cond);
         pthread_cond_signal(&tree.levels[current_level].waiting_at_lower_cond);
 
-        printf("gnome#%u moves up to level#%lu\n", gnome_id, current_level + 1);
+        printf("gnome#%u moves up to level#%ld\n", gnome_id, current_level + 1);
         return current_level + 1;
     }
 
@@ -274,7 +350,7 @@ long go_up_the_tree(long current_level, unsigned gnome_id) {
 
     // if the destination level is currently full:
     while (1) {
-        printf("gnome#%u waits to move up to level#%lu\n", gnome_id, current_level + 1);
+        printf("gnome#%u waits to move up to level#%ld\n", gnome_id, current_level + 1);
 
         pthread_cond_wait(
             &tree.levels[current_level + 1].waiting_at_lower_cond,
@@ -293,21 +369,21 @@ long go_up_the_tree(long current_level, unsigned gnome_id) {
             pthread_mutex_unlock(&tree.levels[current_level].n_gnomes_mutex);
             pthread_mutex_unlock(&tree.levels[current_level + 1].n_gnomes_mutex);
 
-            printf("gnome#%u moves up to level#%lu\n", gnome_id, current_level + 1);
+            printf("gnome#%u moves up to level#%ld\n", gnome_id, current_level + 1);
             return current_level + 1;
         }
-        printf("gnome#%u retries to move up to level#%lu", gnome_id, current_level + 1);
+        printf("gnome#%u retries to move up to level#%ld", gnome_id, current_level + 1);
     }
 
     // this should never be reached
     printf("gnome#%u had a stroke and fell to the ground floor\n", gnome_id);
     return 0xffffffff;
-}
+} 
 
 // see go_up_the_tree() for comments
 long go_down_the_tree(long current_level, unsigned gnome_id) {
     if (current_level < 0) {
-        printf("gnome#%u stays at level#%lu", gnome_id, current_level);
+        printf("gnome#%u stays at level#%ld", gnome_id, current_level);
         return -1;
     }
 
@@ -336,12 +412,12 @@ long go_down_the_tree(long current_level, unsigned gnome_id) {
         pthread_cond_signal(&tree.levels[current_level].waiting_at_lower_cond);
         pthread_cond_signal(&tree.levels[current_level].waiting_at_upper_cond);
 
-        printf("gnome#%u moves down to level#%lu\n", gnome_id, current_level - 1);
+        printf("gnome#%u moves down to level#%ld\n", gnome_id, current_level - 1);
         return current_level - 1;
     }
 
     while (1) {
-        printf("gnome#%u waits to move down to level#%lu\n", gnome_id, current_level - 1);
+        printf("gnome#%u waits to move down to level#%ld\n", gnome_id, current_level - 1);
 
         pthread_cond_wait(
             &tree.levels[current_level - 1].waiting_at_upper_cond,
@@ -358,14 +434,222 @@ long go_down_the_tree(long current_level, unsigned gnome_id) {
             pthread_mutex_unlock(&tree.levels[current_level].n_gnomes_mutex);
             pthread_mutex_unlock(&tree.levels[current_level - 1].n_gnomes_mutex);
 
-            printf("gnome#%u moves down to level#%lu\n", gnome_id, current_level - 1);
+            printf("gnome#%u moves down to level#%ld\n", gnome_id, current_level - 1);
             return current_level - 1;
         }
-        printf("gnome#%u retries to move up to level#%lu", gnome_id, current_level - 1);
+        printf("gnome#%u retries to move up to level#%ld", gnome_id, current_level - 1);
     }
 
     printf("gnome#%u had a stroke and fell to the ground floor\n", gnome_id);
     return 0xffffffff;
+} */
+
+long go_up_the_tree(long level, unsigned gnome_id) {
+    if (level == tree.n_levels - 1) {
+        printf("gnome#%u stays at level#%ld", gnome_id, level);
+        return level;
+    }
+
+    long *next_down_id = &tree.levels[level + 1].next_down_id;
+    pthread_mutex_t *go_down_mutex = &tree.levels[level + 1].go_down_mutex;
+    pthread_cond_t *go_down_cond = &tree.levels[level + 1].go_down_cond;
+
+    long *next_up_id;
+    pthread_mutex_t *go_up_mutex;
+    pthread_cond_t *go_up_cond;
+    if (level == -1) {
+        next_up_id = &tree.next_enter_id;
+        go_up_mutex = &tree.entrance_mutex;
+        go_up_cond = &tree.entrance_cond;
+    } else {
+        next_up_id = &tree.levels[level].next_up_id;
+        go_up_mutex = &tree.levels[level].go_up_mutex;
+        go_up_cond = &tree.levels[level].go_up_cond;
+    }
+    
+    while (tree.levels[level + 1].n_gnomes_current == tree.levels[level + 1].gnome_cap) {
+        printf("gnome#%u is waiting to go up to level#%ld\n", gnome_id, level + 1);
+
+        pthread_mutex_lock(go_up_mutex);
+        long up_id = *next_up_id; 
+        pthread_mutex_unlock(go_up_mutex);
+        pthread_mutex_lock(go_down_mutex);
+        long down_id = *next_down_id;
+        pthread_mutex_unlock(go_down_mutex);
+
+        printf("debug#%u: up_id=%ld, down_id=%ld\n", gnome_id, up_id, down_id);
+
+        // if somebody's waiting on the upper level, swap
+        if (up_id == -1 && down_id != -1) {
+            pthread_mutex_lock(go_up_mutex);
+            *next_up_id = gnome_id;
+            pthread_mutex_unlock(go_up_mutex);
+
+            pthread_cond_broadcast(go_down_cond);
+
+            printf("gnome#%u initiates a swap up to level#%ld\n", gnome_id, level + 1);
+            return level + 1;
+        }
+
+        // if next_up_id is unset, set it to your id (occupy the queue)
+        if (up_id == -1) {
+            pthread_mutex_lock(go_up_mutex);
+            *next_up_id = (long)gnome_id;
+            up_id = (long)gnome_id;
+            pthread_mutex_unlock(go_up_mutex);
+        }
+
+        if (up_id != (long)gnome_id || down_id == -1) {
+            pthread_mutex_lock(go_up_mutex);
+            pthread_cond_wait(go_up_cond, go_up_mutex);
+            pthread_mutex_unlock(go_up_mutex);
+            continue;
+        }
+
+        // if this was reached, it means that the upper level wants to swap
+        pthread_mutex_lock(go_up_mutex);
+        pthread_mutex_lock(go_down_mutex);
+        *next_up_id = -1;
+        *next_down_id = -1;
+        pthread_cond_broadcast(go_up_cond);
+        pthread_cond_broadcast(go_down_cond);
+        pthread_mutex_unlock(go_down_mutex);
+        pthread_mutex_unlock(go_up_mutex);
+
+        printf("gnome#%u follows up on a swap up to level #%lu\n", gnome_id, level + 1);
+        return level + 1;
+    }
+
+    // if this was reached, it means there's a free space on the upper level
+
+    pthread_mutex_lock(go_up_mutex);
+    if (*next_up_id == gnome_id) {
+        *next_up_id = -1;
+    }
+    pthread_mutex_unlock(go_up_mutex);
+
+    // switch the level
+    pthread_mutex_lock(&tree.levels[level + 1].n_gnomes_mutex);
+    tree.levels[level + 1].n_gnomes_current += 1;
+    if (level >= 0) {
+        pthread_mutex_lock(&tree.levels[level].n_gnomes_mutex);
+        tree.levels[level].n_gnomes_current -= 1;
+        pthread_mutex_unlock(&tree.levels[level].n_gnomes_mutex);
+    }
+    pthread_mutex_unlock(&tree.levels[level + 1].n_gnomes_mutex);
+
+    // signal to those waiting for a free space on the current level
+    pthread_cond_signal(go_down_cond);
+    if (level > 0) {
+        pthread_cond_signal(&tree.levels[level - 1].go_up_cond);
+    }
+
+    printf("gnome#%u moves up to level#%ld\n", gnome_id, level + 1);
+    return level + 1;
+}
+
+long go_down_the_tree(long level, unsigned gnome_id) {
+    if (level < 0) {
+        printf("gnome#%u stays at the ground floor\n", gnome_id);
+        return -1;
+    }
+
+    if (level == 0) {
+        pthread_mutex_lock(&tree.levels[level].n_gnomes_mutex);
+        tree.levels[level].n_gnomes_current -= 1;
+        pthread_mutex_unlock(&tree.levels[level].n_gnomes_mutex);
+        if (tree.n_levels > 1) {
+            pthread_cond_broadcast(&tree.levels[1].go_down_cond);
+        }
+        pthread_cond_broadcast(&tree.entrance_cond);
+
+        printf("gnome#%u moves down to the ground floor\n", gnome_id);
+        return -1;
+    }
+
+    long *next_down_id = &tree.levels[level].next_down_id;
+    pthread_mutex_t *go_down_mutex = &tree.levels[level].go_down_mutex;
+    pthread_cond_t *go_down_cond = &tree.levels[level].go_down_cond;
+
+    long *next_up_id = &tree.levels[level - 1].next_up_id;
+    pthread_mutex_t *go_up_mutex = &tree.levels[level - 1].go_up_mutex;
+    pthread_cond_t *go_up_cond = &tree.levels[level - 1].go_up_cond;
+    
+    while (tree.levels[level - 1].n_gnomes_current == tree.levels[level - 1].gnome_cap) {
+        printf("gnome#%u is waiting to go down to level#%ld\n", gnome_id, level - 1);
+
+        pthread_mutex_lock(go_up_mutex);
+        long up_id = *next_up_id; 
+        pthread_mutex_unlock(go_up_mutex);
+        pthread_mutex_lock(go_down_mutex);
+        long down_id = *next_down_id;
+        pthread_mutex_unlock(go_down_mutex);
+
+        printf("debug#%u: up_id=%ld, down_id=%ld\n", gnome_id, up_id, down_id);
+
+        // if somebody's waiting on the lower level, swap
+        if (down_id == -1 && up_id != -1) {
+            pthread_mutex_lock(go_down_mutex);
+            *next_down_id = gnome_id;
+            pthread_mutex_unlock(go_down_mutex);
+            
+            pthread_cond_broadcast(go_up_cond);
+
+            printf("gnome#%u initiates a swap down to level#%ld\n", gnome_id, level - 1);
+            return level - 1;
+        }
+
+        // if next_down_id is unset, set it to your id (occupy the queue)
+        if (down_id == -1) {
+            pthread_mutex_lock(go_down_mutex);
+            *next_down_id = (long)gnome_id;
+            down_id = (long)gnome_id;
+            pthread_mutex_unlock(go_down_mutex);
+        }
+
+        if (down_id != (long)gnome_id || up_id == -1) {
+            pthread_mutex_lock(go_down_mutex);
+            pthread_cond_wait(go_down_cond, go_down_mutex);
+            pthread_mutex_unlock(go_down_mutex);
+            continue;
+        }
+
+        // if this was reached, it means that the lower level wants to swap
+        pthread_mutex_lock(go_up_mutex);
+        pthread_mutex_lock(go_down_mutex);
+        *next_up_id = -1;
+        *next_down_id = -1;
+        pthread_cond_broadcast(go_up_cond);
+        pthread_cond_broadcast(go_down_cond);
+        pthread_mutex_unlock(go_down_mutex);
+        pthread_mutex_unlock(go_up_mutex);
+
+        printf("gnome#%u follows up on a swap down to level #%lu\n", gnome_id, level - 1);
+        return level - 1;
+    }
+
+    // if this was reached, it means there's a free space on the lower level
+
+    pthread_mutex_lock(go_down_mutex);
+    if (*next_down_id == gnome_id) {
+        *next_down_id = -1;
+    }
+    pthread_mutex_unlock(go_down_mutex);
+
+    // switch the level
+    pthread_mutex_lock(&tree.levels[level - 1].n_gnomes_mutex);
+    pthread_mutex_lock(&tree.levels[level].n_gnomes_mutex);
+    tree.levels[level - 1].n_gnomes_current += 1;
+    tree.levels[level].n_gnomes_current -= 1;
+    pthread_mutex_unlock(&tree.levels[level].n_gnomes_mutex);
+    pthread_mutex_unlock(&tree.levels[level - 1].n_gnomes_mutex);
+
+    // signal to those waiting for a free space on the current level
+    pthread_cond_signal(go_up_cond);
+    pthread_cond_signal(&tree.levels[level + 1].go_down_cond);
+
+    printf("gnome#%u moves down to level#%ld\n", gnome_id, level - 1);
+    return level - 1;
 }
 
 // returns 0 on success, -1 on failure
@@ -471,6 +755,19 @@ void *gnome(void *arg) {
     }
 
     return NULL;
+}
+
+void *santa(void *arg) {
+    while (1) {
+        pthread_mutex_lock(&delivery.n_ornaments_mutex);
+        printf("delivery: %u ornaments delivered for a total of %u\n",
+            delivery.ornaments_per_delivery,
+            delivery.n_ornaments_current + delivery.ornaments_per_delivery);
+        delivery.n_ornaments_current += delivery.ornaments_per_delivery;
+        pthread_mutex_unlock(&delivery.n_ornaments_mutex);
+        pthread_cond_broadcast(&delivery.n_ornaments_cond);
+        usleep(delivery.interval_microseconds);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -582,8 +879,8 @@ int main(int argc, char **argv) {
         );
     }
 
-    pthread_t *threads = (pthread_t *)malloc(sizeof(pthread_t) * n_gnomes);
-    if (threads == (pthread_t *)0) {
+    pthread_t *gnome_threads = (pthread_t *)malloc(sizeof(pthread_t) * n_gnomes);
+    if (gnome_threads == (pthread_t *)0) {
         fprintf(stderr, "ERROR: failed to allocate memory for thread handles\n");
         kill_ornament_delivery();
         kill_xmas_tree();
@@ -593,7 +890,7 @@ int main(int argc, char **argv) {
     unsigned *gnome_ids = (unsigned *)malloc(sizeof(unsigned) * n_gnomes);
     if (gnome_ids == (unsigned *)0) {
         fprintf(stderr, "ERROR: failed to allocate memory for gnome_ids\n");
-        free(threads);
+        free(gnome_threads);
         kill_ornament_delivery();
         kill_xmas_tree();
         exit(1);
@@ -601,26 +898,32 @@ int main(int argc, char **argv) {
 
     for (size_t i = 0; i < n_gnomes; i++) {
         gnome_ids[i] = (unsigned)i;
-        if (pthread_create(&threads[i], NULL, gnome, &gnome_ids[i]) != 0) {
-            fprintf(stderr, "ERROR: failed to allocate memory for thread handles\n");
-            free(threads);
+        if (pthread_create(&gnome_threads[i], NULL, gnome, &gnome_ids[i]) != 0) {
+            fprintf(stderr, "ERROR: failed to init gnome_threads[%lu]\n", i);
+            free(gnome_threads);
             kill_ornament_delivery();
             kill_xmas_tree();
             exit(1);
         }
     }
 
-    // handle ornament delivery in the main thread
-    while (1) {
-        pthread_mutex_lock(&delivery.n_ornaments_mutex);
-        printf("delivery: %u ornaments delivered for a total of %u\n",
-            delivery.ornaments_per_delivery,
-            delivery.n_ornaments_current + delivery.ornaments_per_delivery);
-        delivery.n_ornaments_current += delivery.ornaments_per_delivery;
-        pthread_mutex_unlock(&delivery.n_ornaments_mutex);
-        pthread_cond_broadcast(&delivery.n_ornaments_cond);
-        usleep(delivery.interval_microseconds);
+    // handle ornament delivery
+    pthread_t santa_thread;
+    if (pthread_create(&santa_thread, NULL, santa, NULL) != 0) {
+        fprintf(stderr, "ERROR: failed to init santa_thread\n");
+        free(gnome_threads);
+        kill_ornament_delivery();
+        kill_xmas_tree();
+        exit(1);
     }
+
+    // wait for all the threads to complete
+    for (size_t i = 0; i < n_gnomes; i++) {
+        pthread_join(gnome_threads[i], NULL);
+        printf("gnome_threads[%lu] joined\n", i);
+    }
+
+    printf("all gnome_threads joined, terminating\n");
     
     // this should never be reached
     kill_ornament_delivery();
